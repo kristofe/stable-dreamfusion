@@ -195,9 +195,6 @@ class Trainer(object):
         self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
-
-        # text prompt
-        ref_text = self.opt.text
     
         model.to(self.device)
         if self.world_size > 1:
@@ -208,20 +205,13 @@ class Trainer(object):
         # guide model
         self.guidance = guidance
 
+        # text prompt
         if self.guidance is not None:
-            assert ref_text is not None, 'Training must provide a text prompt!'
-
+            
             for p in self.guidance.parameters():
                 p.requires_grad = False
 
-            if not self.opt.dir_text:
-                self.text_z = self.guidance.get_text_embeds([ref_text])
-            else:
-                self.text_z = []
-                for d in ['front', 'side', 'back', 'side', 'overhead', 'bottom']:
-                    text = f"{ref_text}, {d} view"
-                    text_z = self.guidance.get_text_embeds([text])
-                    self.text_z.append(text_z)
+            self.prepare_text_embeddings()
         
         else:
             self.text_z = None
@@ -257,7 +247,7 @@ class Trainer(object):
             "results": [], # metrics[0], or valid_loss
             "checkpoints": [], # record path of saved ckpt, to automatically remove old ckpt
             "best_result": None,
-            }
+        }
 
         # auto fix
         if len(metrics) == 0 or self.use_loss_as_metric:
@@ -297,6 +287,37 @@ class Trainer(object):
                 self.log(f"[INFO] Loading {self.use_checkpoint} ...")
                 self.load_checkpoint(self.use_checkpoint)
 
+    # calculate the text embs.
+    def prepare_text_embeddings(self):
+
+        if self.opt.text is None:
+            self.log(f"[WARN] text prompt is not provided.")
+            self.text_z = None
+            return
+
+        if not self.opt.dir_text:
+            self.text_z = self.guidance.get_text_embeds([self.opt.text], [self.opt.negative])
+        else:
+            self.text_z = []
+            for d in ['front', 'side', 'back', 'side', 'overhead', 'bottom']:
+                # construct dir-encoded text
+                text = f"{self.opt.text}, {d} view"
+
+                negative_text = f"{self.opt.negative}"
+
+                # explicit negative dir-encoded text
+                if self.opt.suppress_face:
+                    if negative_text != '': negative_text += ', '
+
+                    if d == 'back': negative_text += "face"
+                    # elif d == 'front': negative_text += ""
+                    elif d == 'side': negative_text += "face"
+                    elif d == 'overhead': negative_text += "face"
+                    elif d == 'bottom': negative_text += "face"
+                
+                text_z = self.guidance.get_text_embeds([text], [negative_text])
+                self.text_z.append(text_z)
+
     def __del__(self):
         if self.log_ptr: 
             self.log_ptr.close()
@@ -330,9 +351,9 @@ class Trainer(object):
             if rand > 0.8: 
                 shading = 'albedo'
                 ambient_ratio = 1.0
-            # elif rand > 0.4: 
-            #     shading = 'textureless'
-            #     ambient_ratio = 0.1
+            elif rand > 0.4: 
+                shading = 'textureless'
+                ambient_ratio = 0.1
             else: 
                 shading = 'lambertian'
                 ambient_ratio = 0.1
@@ -375,6 +396,10 @@ class Trainer(object):
         if self.opt.lambda_orient > 0 and 'loss_orient' in outputs:
             loss_orient = outputs['loss_orient']
             loss = loss + self.opt.lambda_orient * loss_orient
+
+        if self.opt.lambda_smooth > 0 and 'loss_smooth' in outputs:
+            loss_smooth = outputs['loss_smooth']
+            loss = loss + self.opt.lambda_smooth * loss_smooth
             
         return pred_rgb, pred_ws, loss
 
@@ -447,6 +472,9 @@ class Trainer(object):
     ### ------------------------------
 
     def train(self, train_loader, valid_loader, max_epochs):
+
+        assert self.text_z is not None, 'Training must provide a text prompt!'
+
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
 
@@ -624,7 +652,7 @@ class Trainer(object):
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 # here spp is used as perturb random seed!
-                preds, preds_depth = self.test_step(data, bg_color=bg_color, perturb=spp)
+                preds, preds_depth = self.test_step(data, bg_color=bg_color, perturb=False if spp == 1 else spp)
 
         if self.ema is not None:
             self.ema.restore()
@@ -855,9 +883,10 @@ class Trainer(object):
 
         else:    
             if len(self.stats["results"]) > 0:
-                if self.stats["best_result"] is None or self.stats["results"][-1] < self.stats["best_result"]:
-                    self.log(f"[INFO] New best result: {self.stats['best_result']} --> {self.stats['results'][-1]}")
-                    self.stats["best_result"] = self.stats["results"][-1]
+                # always save best since loss cannot reflect performance.
+                if True:
+                    # self.log(f"[INFO] New best result: {self.stats['best_result']} --> {self.stats['results'][-1]}")
+                    # self.stats["best_result"] = self.stats["results"][-1]
 
                     # save ema results 
                     if self.ema is not None:
